@@ -1,0 +1,18 @@
+# RENDER: koi file upload nahi karni. Render dashboard -> Environment me ye badlo / jodo, phir redeploy.
+# (baaki jo pehle se hain - PUBLIC_BASE, CORS_ORIGINS, ADMIN_KEY, SQL_URL, DIRECT_IMG - jaise hain waise rehne do)
+
+# 1) Wispbyte ka https address, aakhir me / nahi
+VIDEO_WORKER=https://WISPBYTE-ADDRESS
+
+# 2) film Render se seedha nahi, Wispbyte se
+DIRECT_VIDEO=0
+
+# 3) Wispbyte ke .env wale LINK_SECRET se bilkul same text
+LINK_SECRET=wahi-same-text
+
+# 4) Hugging Face relay band: ye dono khali ya delete
+STREAM_RELAY=
+RELAY_KEY=
+
+# Sirf tab, agar mp4 qualities na chalein:
+# DL_LINKS=0

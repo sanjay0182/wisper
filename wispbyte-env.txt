@@ -1,0 +1,13 @@
+# Copy to  .env  on Wispbyte.
+# MUST be exactly the same text as LINK_SECRET on Render (otherwise every film link is refused)
+LINK_SECRET=put-the-same-long-random-text-as-on-render
+# the fixed link base of the CDN referer (leave as is)
+DEFAULT_REFERER=https://netfilm.world/
+# only these pages may load video from here; * = any (links are signed anyway)
+WORKER_ORIGINS=*
+# 1 = a link works only from the ip it was made for (can break on wifi <-> mobile switch). Start with 0.
+WORKER_CHECK_IP=0
+# 1 only if a tunnel / proxy sits in front of this server
+WORKER_TRUST_PROXY=0
+# optional: send the CDN requests through a proxy
+# UPSTREAM_PROXY=http://user:pass@host:port
