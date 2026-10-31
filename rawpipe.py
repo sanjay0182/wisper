@@ -23,6 +23,7 @@ import ssl
 import time
 from urllib.parse import parse_qs, quote, urlsplit
 
+import tlspass
 import worker
 import worker_core as core
 
@@ -33,7 +34,7 @@ _ctx = ssl.create_default_context()
 if not VERIFY_TLS:
     _ctx.check_hostname = False
     _ctx.verify_mode = ssl.CERT_NONE
-STATS = {"raw": 0, "fallback": 0, "pass": 0, "bytes": 0, "new_conn": 0, "reused": 0, "http": 0}
+STATS = {"raw": 0, "fallback": 0, "pass": 0, "bytes": 0, "new_conn": 0, "reused": 0, "http": 0, "tls": 0}
 
 # ---- upstream connection pool: a TLS handshake + certificate check per request is the most expensive thing on a slow CPU ----
 _POOL = {}
@@ -113,12 +114,12 @@ async def stats_loop():
         now, cn = time.time(), time.process_time()
         d = {k: STATS[k] - last.get(k, 0) for k in STATS}
         last = dict(STATS)
-        if d["raw"] or d["fallback"] or d["pass"]:
+        if d["raw"] or d["fallback"] or d["pass"] or d["tls"]:
             mb = d["bytes"] / 1048576.0
             cpu = (cn - c0) / max(0.001, now - t0) * 100
-            print("[cpu] %ds: cpu=%d%% requests=%d (pipe=%d careful=%d app=%d) data=%.1fMB (%.2f cpu-sec/MB) new_tls=%d reused=%d http_pipe=%d" % (
-                now - t0, cpu, d["raw"] + d["fallback"] + d["pass"], d["raw"], d["fallback"], d["pass"], mb,
-                ((cn - c0) / mb) if mb else 0, d["new_conn"], d["reused"], d["http"]), flush=True)
+            print("[cpu] %ds: cpu=%d%% requests=%d (pipe=%d careful=%d app=%d) data=%.1fMB (%.2f cpu-sec/MB) new_tls=%d reused=%d http_pipe=%d tls_pass=%d" % (
+                now - t0, cpu, d["raw"] + d["fallback"] + d["pass"] + d["tls"], d["raw"], d["fallback"], d["pass"], mb,
+                ((cn - c0) / mb) if mb else 0, d["new_conn"], d["reused"], d["http"], d["tls"]), flush=True)
         t0, c0 = now, cn
 
 
@@ -261,7 +262,7 @@ async def _playlist(writer, r, u2, p, q, t, origin):
     await writer.drain()
 
 
-async def _open_pipe(csp, method, ref, rng):
+async def _open_pipe(csp, method, ref, rng, why=None):
     """open (or reuse) a connection to the CDN for csp, send the head, read the answer head.
     -> (reader, writer, status_parts, response_headers) when the answer is a plain 200/206 body the pipe can copy,
        None otherwise (error, 4xx/5xx, redirect, playlist). A connection that is not usable is closed here."""
@@ -283,6 +284,9 @@ async def _open_pipe(csp, method, ref, rng):
             rhdr = rh[3] if rh else []
             ct = _get(rhdr, "content-type").lower()
             if code not in (200, 206) or "mpegurl" in ct or _get(rhdr, "location"):
+                if why is not None:
+                    why.append("status %d%s%s" % (code, (" -> " + _get(rhdr, "location")[:80]) if _get(rhdr, "location") else "",
+                                                  " (playlist)" if "mpegurl" in ct else ""))
                 try:
                     uw.close()                          # needs the careful path (fresh link, other host, playlist)
                 except Exception:
@@ -297,12 +301,72 @@ async def _open_pipe(csp, method, ref, rng):
                     pass
             if attempt == 0 and was_reused:
                 continue                                # a pooled connection had gone stale: once more with a fresh one
+            if why is not None:
+                why.append(repr(ex)[:100])
             print("[relay] pipe open failed (%s %s): %s" % (csp.scheme, worker._host(csp.geturl()), repr(ex)[:100]), flush=True)
             return None
     return None
 
 
-async def _handle_p(reader, writer, method, target, hdr, peer):
+_PASS_BAD = {}          # host -> time: the CDN could not do TLS 1.2 + AES-GCM (or the handshake failed); do not try again for a while
+PASS_BAD_TTL = int(os.getenv("PASS_BAD_TTL", "1800"))
+
+
+async def _try_pass(csp, ref, rng, writer, origin):
+    """TLS pass-through (see tlspass.py): True = the whole answer was sent (locked bytes + key for the phone), False = use the normal path"""
+    host = csp.hostname or ""
+    if time.time() - _PASS_BAD.get(host, 0) < PASS_BAD_TTL:
+        return False
+    why = []
+    port = csp.port or 443
+    hd = "Host: %s\r\nUser-Agent: %s\r\nReferer: %s\r\nOrigin: %s\r\nAccept: */*\r\nAccept-Encoding: identity\r\n" % (
+        csp.netloc, worker.UA, ref, ref.rstrip("/"))
+    if rng:
+        hd += "Range: %s\r\n" % rng
+    hd += "Connection: close"
+    res = await tlspass.open_pass(host, port, (csp.path or "/") + (("?" + csp.query) if csp.query else ""), hd, why)
+    if res is None:
+        _PASS_BAD[host] = time.time()
+        print("[relay] tls pass-through %s: not possible (%s) - normal https for %dmin" % (host, "; ".join(why) or "?", PASS_BAD_TTL // 60), flush=True)
+        return False
+    rhdr = res["hdr"]
+    ct = _get(rhdr, "content-type").lower()
+    if res["status"] not in (200, 206) or "mpegurl" in ct or _get(rhdr, "location"):
+        print("[relay] tls pass-through %s: answer is %d%s - careful path" % (host, res["status"], (" -> " + _get(rhdr, "location")[:80]) if _get(rhdr, "location") else ""), flush=True)
+        res["writer"].close()
+        return False
+    if _HTTP_LOG.get(("pass", host), 0) + 600 < time.time():
+        _HTTP_LOG[("pass", host)] = time.time()
+        print("[relay] tls pass-through %s: WORKS (%s) - no decrypt here, the phone opens it" % (host, res["name"]), flush=True)
+    STATS["tls"] += 1
+    head = ("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nX-Tls: %s.%s.%d\r\nCache-Control: no-store\r\n%s"
+            "Access-Control-Expose-Headers: X-Tls\r\nConnection: close\r\n\r\n" % (res["k"], res["s"], res["q"], _cors(origin))).encode("latin-1")
+    ur, uw = res["reader"], res["writer"]
+    try:
+        writer.write(head + b"".join(res["raws"]))
+        STATS["bytes"] += sum(len(x) for x in res["raws"])
+        await writer.drain()
+        while True:
+            d = await asyncio.wait_for(ur.read(CHUNK), 30)
+            if not d:
+                break
+            writer.write(d)
+            STATS["bytes"] += len(d)
+            await writer.drain()
+    except Exception:
+        pass                                    # the phone has what it needs and hung up, or the CDN went quiet
+    finally:
+        try:
+            uw.close()
+        except Exception:
+            pass
+    return True
+
+
+_HTTP_LOG = {}
+
+
+async def _handle_p(reader, writer, method, target, hdr, peer, pt=False):
     origin = _get(hdr, "origin")
     if method == "OPTIONS":
         req_h = _get(hdr, "access-control-request-headers", "*")
@@ -360,10 +424,14 @@ async def _handle_p(reader, writer, method, target, hdr, peer):
         cands.append(sp)
         simple = False
         for csp in cands:
-            res = await _open_pipe(csp, method, ref, rng)
+            if pt and csp.scheme == "https" and not is_head:
+                if await _try_pass(csp, ref, rng, writer, origin):
+                    return                              # sent: locked bytes + key, the phone opens them
+            rwhy = []
+            res = await _open_pipe(csp, method, ref, rng, rwhy)
             if csp is not sp and mode == "test":        # a fresh test of this host: remember the result
                 _HTTP_MEM[host] = (res is not None, time.time())
-                print("[relay] http test %s: %s (remembered %dh)" % (host, "WORKS - no TLS decrypt" if res else "refused - https", HTTP_TTL // 3600), flush=True)
+                print("[relay] http test %s: %s (remembered %dh)" % (host, "WORKS - no TLS decrypt" if res else "refused - https; reason: " + ("; ".join(rwhy) or "?"), HTTP_TTL // 3600), flush=True)
             if res is not None:
                 ur, uw, st, rhdr = res
                 sp = csp
@@ -433,8 +501,9 @@ async def handle(reader, writer, internal_port):
         if not parsed:
             return await _send_simple(writer, 400, "bad request")
         method, target, _, hdr = parsed
-        if target.split("?", 1)[0] == "/p":
-            await _handle_p(reader, writer, method, target, hdr, peer)
+        tp = target.split("?", 1)[0]
+        if tp == "/p" or tp == "/pt":
+            await _handle_p(reader, writer, method, target, hdr, peer, tp == "/pt")
         else:
             await _splice(reader, writer, head[:-4], hdr, internal_port)
     except (ConnectionError, asyncio.CancelledError, asyncio.IncompleteReadError):

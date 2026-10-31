@@ -37,3 +37,16 @@ WORKER_TRUST_PROXY=0
 #                then ONE new test. One failed http request while http is marked "works" is repeated over https for that
 #                request only. The result is lost when the relay restarts (first request tests again).
 # Logs: a line "[relay] http test <host>: WORKS / refused" at each test, and http_pipe=<n> in the [cpu] line.
+
+# --- TLS PASS-THROUGH (new): relay does NOT decrypt the CDN's https, the phone does (needs sw.js + tlsdec.js on the site) ---
+# The phone's service worker asks  /pt?...  instead of  /p?...  The relay then does only the TLS handshake and the request (with the swapped
+# Referer), and copies the locked bytes to the phone together with the key of that one connection (header X-Tls). Order of tries per request:
+#   1. http://  (HTTP_FIRST, remembered 24 h)   2. pass-through (this)   3. normal https with decrypt on the relay (old way)
+# TLS_PASS=1          (default) 0 = never pass through
+# PASS_BAD_TTL=1800   seconds a CDN host is skipped after pass-through was not possible for it (no TLS 1.2 / no AES-GCM / handshake error)
+# PASS_SESSION_TTL=3600  seconds a TLS session is reused (a resumed handshake costs about 1/4 of a full one)
+# PASS_KEYLOG=        (not needed) the relay writes the session keys of its own CDN connections to /dev/shm (or the temp dir) with mode 600
+#                     and empties that file when it passes 256 KB. Nothing else is stored.
+# Logs:  "[relay] tls pass-through <host>: WORKS ..."  or  "not possible (<reason>)"  or  "answer is <status> ..."
+#        "[relay] http test <host>: refused - https; reason: <status / Location / error>"   <- why http:// was refused
+#        [cpu] line: tls_pass=<n> = requests that were passed through
