@@ -23,3 +23,10 @@ WORKER_TRUST_PROXY=0
 # The normal app runs on 127.0.0.1 (port+1) for everything else.  If this causes any trouble: RAW_PIPE=0 = old mode.
 # RAW_PIPE=1
 # INTERNAL_PORT=   (only if port+1 is taken)
+
+# --- CPU: find the real cause ---
+# While a video plays, open   https://<your-wispbyte>/_prof?k=<LINK_SECRET>&s=20   (20 s profile, text) and send it.
+# The logs also get a line every 10 s:  [cpu] ... cpu=..% requests=.. data=..MB new_tls=.. reused=..
+# POOL_TTL=20     seconds an idle CDN connection is kept for the next request
+# POOL_MAX=4      idle connections kept per CDN host
+# RAW_VERIFY_TLS=0  skips the CDN certificate check (saves CPU on every new TLS connection; video bytes are not secret). Default 1.

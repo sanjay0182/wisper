@@ -49,6 +49,7 @@ async def _run_raw(port):
     raw = await asyncio.start_server(lambda r, w: rawpipe.handle(r, w, internal), "0.0.0.0", port,
                                      limit=rawpipe.CHUNK * 2, backlog=256)
     print("[relay] raw pipe on :%s (app on 127.0.0.1:%s)" % (port, internal), flush=True)
+    asyncio.create_task(rawpipe.stats_loop())
     await asyncio.gather(task, raw.serve_forever())
 
 

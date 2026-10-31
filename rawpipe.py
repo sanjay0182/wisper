@@ -33,7 +33,68 @@ _ctx = ssl.create_default_context()
 if not VERIFY_TLS:
     _ctx.check_hostname = False
     _ctx.verify_mode = ssl.CERT_NONE
-STATS = {"raw": 0, "fallback": 0, "pass": 0, "bytes": 0}
+STATS = {"raw": 0, "fallback": 0, "pass": 0, "bytes": 0, "new_conn": 0, "reused": 0}
+
+# ---- upstream connection pool: a TLS handshake + certificate check per request is the most expensive thing on a slow CPU ----
+_POOL = {}
+POOL_TTL = int(os.getenv("POOL_TTL", "20"))
+POOL_MAX = int(os.getenv("POOL_MAX", "4"))
+
+
+def _pool_key(sp):
+    return (sp.scheme, sp.hostname, sp.port or (443 if sp.scheme == "https" else 80))
+
+
+async def _acquire(sp, fresh=False):
+    """-> (reader, writer, reused)"""
+    key = _pool_key(sp)
+    lst = _POOL.get(key) or []
+    while lst and not fresh:
+        r, w, t = lst.pop()
+        if time.time() - t < POOL_TTL and not w.is_closing() and not r.at_eof():
+            STATS["reused"] += 1
+            return r, w, True
+        try:
+            w.close()
+        except Exception:
+            pass
+    port = key[2]
+    r, w = await asyncio.wait_for(asyncio.open_connection(
+        sp.hostname, port, ssl=_ctx if sp.scheme == "https" else None,
+        server_hostname=sp.hostname if sp.scheme == "https" else None, limit=CHUNK * 2), 10)
+    STATS["new_conn"] += 1
+    return r, w, False
+
+
+def _release(sp, r, w):
+    key = _pool_key(sp)
+    lst = _POOL.setdefault(key, [])
+    if len(lst) < POOL_MAX and not w.is_closing():
+        lst.append((r, w, time.time()))
+    else:
+        try:
+            w.close()
+        except Exception:
+            pass
+
+
+async def stats_loop():
+    """one line every 10 s while video moves: where the CPU goes, in numbers"""
+    last = dict(STATS)
+    t0, c0 = time.time(), time.process_time()
+    while True:
+        await asyncio.sleep(10)
+        now, cn = time.time(), time.process_time()
+        d = {k: STATS[k] - last.get(k, 0) for k in STATS}
+        last = dict(STATS)
+        if d["raw"] or d["fallback"] or d["pass"]:
+            mb = d["bytes"] / 1048576.0
+            cpu = (cn - c0) / max(0.001, now - t0) * 100
+            print("[cpu] %ds: cpu=%d%% requests=%d (pipe=%d careful=%d app=%d) data=%.1fMB (%.2f cpu-sec/MB) new_tls=%d reused=%d" % (
+                now - t0, cpu, d["raw"] + d["fallback"] + d["pass"], d["raw"], d["fallback"], d["pass"], mb,
+                ((cn - c0) / mb) if mb else 0, d["new_conn"], d["reused"]), flush=True)
+        t0, c0 = now, cn
+
 
 _CORS_EXPOSE = "Content-Length, Content-Range, Accept-Ranges, Content-Type"
 
@@ -221,28 +282,40 @@ async def _handle_p(reader, writer, method, target, hdr, peer):
     path_l = sp.path.lower()
     simple = (".m3u8" not in path_l) and sp.scheme in ("http", "https") and not worker._HOSTMAP.get(sp.hostname or "")
     ur = uw = None
+    reusable = False
     if simple:
-        try:
-            port = sp.port or (443 if sp.scheme == "https" else 80)
-            ur, uw = await asyncio.wait_for(asyncio.open_connection(
-                sp.hostname, port, ssl=_ctx if sp.scheme == "https" else None,
-                server_hostname=sp.hostname if sp.scheme == "https" else None, limit=CHUNK * 2), 10)
-            rq = "%s %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nReferer: %s\r\nOrigin: %s\r\nAccept: */*\r\nAccept-Encoding: identity\r\n" % (
-                method, (sp.path or "/") + (("?" + sp.query) if sp.query else ""), sp.netloc, worker.UA, ref, ref.rstrip("/"))
-            if rng:
-                rq += "Range: %s\r\n" % rng
-            uw.write((rq + "Connection: close\r\n\r\n").encode("latin-1"))
-            raw = await asyncio.wait_for(ur.readuntil(b"\r\n\r\n"), 20)
-            st = raw.split(b"\r\n", 1)[0].decode("latin-1").split(" ", 2)
-            code = int(st[1])
-            rh = _parse_head(b"X / X\r\n" + raw.split(b"\r\n", 1)[1])
-            rhdr = rh[3] if rh else []
-            ct = _get(rhdr, "content-type").lower()
-            if code not in (200, 206) or "mpegurl" in ct or _get(rhdr, "location"):
-                simple = False                      # needs the careful path (fresh link, other host, playlist)
-        except Exception as ex:
-            print("[relay] pipe open failed (%s): %s" % (worker._host(u), repr(ex)[:100]), flush=True)
-            simple = False
+        was_reused = False
+        for attempt in (0, 1):
+            ur = uw = None
+            was_reused = False
+            try:
+                ur, uw, was_reused = await _acquire(sp, fresh=bool(attempt))
+                rq = "%s %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nReferer: %s\r\nOrigin: %s\r\nAccept: */*\r\nAccept-Encoding: identity\r\n" % (
+                    method, (sp.path or "/") + (("?" + sp.query) if sp.query else ""), sp.netloc, worker.UA, ref, ref.rstrip("/"))
+                if rng:
+                    rq += "Range: %s\r\n" % rng
+                uw.write((rq + "Connection: keep-alive\r\n\r\n").encode("latin-1"))
+                raw = await asyncio.wait_for(ur.readuntil(b"\r\n\r\n"), 20)
+                st = raw.split(b"\r\n", 1)[0].decode("latin-1").split(" ", 2)
+                code = int(st[1])
+                rh = _parse_head(b"X / X\r\n" + raw.split(b"\r\n", 1)[1])
+                rhdr = rh[3] if rh else []
+                ct = _get(rhdr, "content-type").lower()
+                if code not in (200, 206) or "mpegurl" in ct or _get(rhdr, "location"):
+                    simple = False                      # needs the careful path (fresh link, other host, playlist)
+                break
+            except Exception as ex:
+                if uw is not None:
+                    try:
+                        uw.close()
+                    except Exception:
+                        pass
+                    uw = None
+                if attempt == 0 and was_reused:
+                    continue                            # a pooled connection had gone stale: once more with a fresh one
+                print("[relay] pipe open failed (%s): %s" % (worker._host(u), repr(ex)[:100]), flush=True)
+                simple = False
+                break
     if simple:
         STATS["raw"] += 1
         keep = [(k, v) for k, v in rhdr if k.lower() in ("content-type", "content-length", "content-range", "accept-ranges", "transfer-encoding")]
@@ -251,22 +324,33 @@ async def _handle_p(reader, writer, method, target, hdr, peer):
         head += "Cache-Control: private, max-age=1800\r\n" + _cors(origin)
         head += "Access-Control-Expose-Headers: %s\r\nConnection: close\r\n\r\n" % _CORS_EXPOSE
         writer.write(head.encode("latin-1"))
+        clen = _get(rhdr, "content-length")
+        reusable = (clen.isdigit() and not is_head and not _get(rhdr, "transfer-encoding")
+                    and "close" not in _get(rhdr, "connection").lower())
+        done = False
         try:
             if not is_head:
-                while True:
-                    d = await ur.read(CHUNK)
+                remaining = int(clen) if reusable else None
+                while remaining is None or remaining > 0:
+                    d = await ur.read(CHUNK if remaining is None else min(CHUNK, remaining))
                     if not d:
                         break
                     writer.write(d)
                     STATS["bytes"] += len(d)
+                    if remaining is not None:
+                        remaining -= len(d)
                     await writer.drain()
+                done = remaining == 0
             else:
                 await writer.drain()
         finally:
-            try:
-                uw.close()
-            except Exception:
-                pass
+            if reusable and done:
+                _release(sp, ur, uw)                  # keep the TLS connection for the next request
+            else:
+                try:
+                    uw.close()
+                except Exception:
+                    pass
         return
     if uw is not None:
         try:

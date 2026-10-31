@@ -272,6 +272,24 @@ async def relay_download(request: Request, subjectId: str = "", se: int = 0, ep:
     return await _relay_data(request, "download", subjectId, se, ep, detailPath)
 
 
+@app.get("/_prof")
+async def prof(k: str = "", s: int = 20):
+    """Where does the CPU go?  Open  /_prof?k=<LINK_SECRET>&s=20  while a video plays: a 20 s profile as text."""
+    key = os.getenv("DEBUG_KEY") or os.getenv("LINK_SECRET", "")
+    if not key or not hmac.compare_digest(k.encode(), key.encode()):
+        return PlainTextResponse("forbidden", status_code=403)
+    import cProfile
+    import io
+    import pstats
+    pr = cProfile.Profile()
+    pr.enable()
+    await asyncio.sleep(max(5, min(int(s), 60)))
+    pr.disable()
+    out = io.StringIO()
+    pstats.Stats(pr, stream=out).sort_stats("tottime").print_stats(35)
+    return PlainTextResponse(out.getvalue(), headers={"Cache-Control": "no-store"})
+
+
 @app.get("/health")
 async def health():
     return {"ok": True, "secret_set": bool(core.secret()), "check_ip": CHECK_IP, "trust_proxy": TRUST_PROXY,
