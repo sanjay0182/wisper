@@ -33,12 +33,38 @@ _ctx = ssl.create_default_context()
 if not VERIFY_TLS:
     _ctx.check_hostname = False
     _ctx.verify_mode = ssl.CERT_NONE
-STATS = {"raw": 0, "fallback": 0, "pass": 0, "bytes": 0, "new_conn": 0, "reused": 0}
+STATS = {"raw": 0, "fallback": 0, "pass": 0, "bytes": 0, "new_conn": 0, "reused": 0, "http": 0}
 
 # ---- upstream connection pool: a TLS handshake + certificate check per request is the most expensive thing on a slow CPU ----
 _POOL = {}
 POOL_TTL = int(os.getenv("POOL_TTL", "20"))
 POOL_MAX = int(os.getenv("POOL_MAX", "4"))
+
+# ---- http first: if the CDN accepts plain http:// the relay needs no TLS decrypt at all (the biggest CPU cost) ----
+# HTTP_FIRST=1 (default) / 0 = always https.  The result is remembered per CDN host for HTTP_TTL seconds (default 24 h):
+#   works -> every request goes over http for 24 h ; refused -> every request goes over https for 24 h ; then ONE new test.
+# If a single http request fails while http is marked "works", only THAT request is repeated over https (the mark stays).
+HTTP_FIRST = os.getenv("HTTP_FIRST", "1") != "0"
+HTTP_TTL = int(os.getenv("HTTP_TTL", "86400"))
+_HTTP_MEM = {}          # host -> (True/False, time of the test)
+
+
+def _http_mode(host):
+    """'test' (no fresh result: try http now), 'http' (works), 'https' (refused)"""
+    m = _HTTP_MEM.get(host)
+    if not m or time.time() - m[1] > HTTP_TTL:
+        return "test"
+    return "http" if m[0] else "https"
+
+
+def _to_http(sp):
+    """same url with http:// (default port 80; an explicit non-443 port is kept)"""
+    host = sp.hostname or ""
+    if ":" in host:
+        host = "[" + host + "]"
+    port = sp.port
+    netloc = host + (":%d" % port if port and port != 443 else "")
+    return urlsplit("http://" + netloc + (sp.path or "/") + (("?" + sp.query) if sp.query else ""))
 
 
 def _pool_key(sp):
@@ -90,9 +116,9 @@ async def stats_loop():
         if d["raw"] or d["fallback"] or d["pass"]:
             mb = d["bytes"] / 1048576.0
             cpu = (cn - c0) / max(0.001, now - t0) * 100
-            print("[cpu] %ds: cpu=%d%% requests=%d (pipe=%d careful=%d app=%d) data=%.1fMB (%.2f cpu-sec/MB) new_tls=%d reused=%d" % (
+            print("[cpu] %ds: cpu=%d%% requests=%d (pipe=%d careful=%d app=%d) data=%.1fMB (%.2f cpu-sec/MB) new_tls=%d reused=%d http_pipe=%d" % (
                 now - t0, cpu, d["raw"] + d["fallback"] + d["pass"], d["raw"], d["fallback"], d["pass"], mb,
-                ((cn - c0) / mb) if mb else 0, d["new_conn"], d["reused"]), flush=True)
+                ((cn - c0) / mb) if mb else 0, d["new_conn"], d["reused"], d["http"]), flush=True)
         t0, c0 = now, cn
 
 
@@ -235,6 +261,47 @@ async def _playlist(writer, r, u2, p, q, t, origin):
     await writer.drain()
 
 
+async def _open_pipe(csp, method, ref, rng):
+    """open (or reuse) a connection to the CDN for csp, send the head, read the answer head.
+    -> (reader, writer, status_parts, response_headers) when the answer is a plain 200/206 body the pipe can copy,
+       None otherwise (error, 4xx/5xx, redirect, playlist). A connection that is not usable is closed here."""
+    was_reused = False
+    for attempt in (0, 1):
+        ur = uw = None
+        was_reused = False
+        try:
+            ur, uw, was_reused = await _acquire(csp, fresh=bool(attempt))
+            rq = "%s %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nReferer: %s\r\nOrigin: %s\r\nAccept: */*\r\nAccept-Encoding: identity\r\n" % (
+                method, (csp.path or "/") + (("?" + csp.query) if csp.query else ""), csp.netloc, worker.UA, ref, ref.rstrip("/"))
+            if rng:
+                rq += "Range: %s\r\n" % rng
+            uw.write((rq + "Connection: keep-alive\r\n\r\n").encode("latin-1"))
+            raw = await asyncio.wait_for(ur.readuntil(b"\r\n\r\n"), 20)
+            st = raw.split(b"\r\n", 1)[0].decode("latin-1").split(" ", 2)
+            code = int(st[1])
+            rh = _parse_head(b"X / X\r\n" + raw.split(b"\r\n", 1)[1])
+            rhdr = rh[3] if rh else []
+            ct = _get(rhdr, "content-type").lower()
+            if code not in (200, 206) or "mpegurl" in ct or _get(rhdr, "location"):
+                try:
+                    uw.close()                          # needs the careful path (fresh link, other host, playlist)
+                except Exception:
+                    pass
+                return None
+            return ur, uw, st, rhdr
+        except Exception as ex:
+            if uw is not None:
+                try:
+                    uw.close()
+                except Exception:
+                    pass
+            if attempt == 0 and was_reused:
+                continue                                # a pooled connection had gone stale: once more with a fresh one
+            print("[relay] pipe open failed (%s %s): %s" % (csp.scheme, worker._host(csp.geturl()), repr(ex)[:100]), flush=True)
+            return None
+    return None
+
+
 async def _handle_p(reader, writer, method, target, hdr, peer):
     origin = _get(hdr, "origin")
     if method == "OPTIONS":
@@ -284,37 +351,25 @@ async def _handle_p(reader, writer, method, target, hdr, peer):
     ur = uw = None
     reusable = False
     if simple:
-        was_reused = False
-        for attempt in (0, 1):
-            ur = uw = None
-            was_reused = False
-            try:
-                ur, uw, was_reused = await _acquire(sp, fresh=bool(attempt))
-                rq = "%s %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nReferer: %s\r\nOrigin: %s\r\nAccept: */*\r\nAccept-Encoding: identity\r\n" % (
-                    method, (sp.path or "/") + (("?" + sp.query) if sp.query else ""), sp.netloc, worker.UA, ref, ref.rstrip("/"))
-                if rng:
-                    rq += "Range: %s\r\n" % rng
-                uw.write((rq + "Connection: keep-alive\r\n\r\n").encode("latin-1"))
-                raw = await asyncio.wait_for(ur.readuntil(b"\r\n\r\n"), 20)
-                st = raw.split(b"\r\n", 1)[0].decode("latin-1").split(" ", 2)
-                code = int(st[1])
-                rh = _parse_head(b"X / X\r\n" + raw.split(b"\r\n", 1)[1])
-                rhdr = rh[3] if rh else []
-                ct = _get(rhdr, "content-type").lower()
-                if code not in (200, 206) or "mpegurl" in ct or _get(rhdr, "location"):
-                    simple = False                      # needs the careful path (fresh link, other host, playlist)
-                break
-            except Exception as ex:
-                if uw is not None:
-                    try:
-                        uw.close()
-                    except Exception:
-                        pass
-                    uw = None
-                if attempt == 0 and was_reused:
-                    continue                            # a pooled connection had gone stale: once more with a fresh one
-                print("[relay] pipe open failed (%s): %s" % (worker._host(u), repr(ex)[:100]), flush=True)
-                simple = False
+        host = sp.hostname or ""
+        cands, mode = [], "https"
+        if HTTP_FIRST and sp.scheme == "https":
+            mode = _http_mode(host)                     # 'test' | 'http' | 'https'  (remembered for HTTP_TTL)
+            if mode != "https":
+                cands.append(_to_http(sp))
+        cands.append(sp)
+        simple = False
+        for csp in cands:
+            res = await _open_pipe(csp, method, ref, rng)
+            if csp is not sp and mode == "test":        # a fresh test of this host: remember the result
+                _HTTP_MEM[host] = (res is not None, time.time())
+                print("[relay] http test %s: %s (remembered %dh)" % (host, "WORKS - no TLS decrypt" if res else "refused - https", HTTP_TTL // 3600), flush=True)
+            if res is not None:
+                ur, uw, st, rhdr = res
+                sp = csp
+                simple = True
+                if csp.scheme == "http" and u.lower().startswith("https"):
+                    STATS["http"] += 1
                 break
     if simple:
         STATS["raw"] += 1

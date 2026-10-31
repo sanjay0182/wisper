@@ -16,3 +16,9 @@ RELAY_KEY=
 
 # Sirf tab, agar mp4 qualities na chalein:
 # DL_LINKS=0
+
+# --- CLIENT RESOLVE (new): phone asks MovieBox for token + links itself, Render only signs the links (/api/sign) ---
+# CLIENT_RESOLVE=1            (default) 0 = off, page uses /api/stream as before
+# CLIENT_CDN_HOSTS=hakunaymatata.com   only https links on these hosts (and sub-domains) are signed. comma separated
+# If the phone cannot do it (CORS / no token / no stream) the page falls back to /api/stream by itself and skips the phone path for 30 min.
+# Also set on the Wispbyte relay:  HTTP_FIRST=1  (see wispbyte-env.txt)

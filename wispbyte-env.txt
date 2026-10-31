@@ -30,3 +30,10 @@ WORKER_TRUST_PROXY=0
 # POOL_TTL=20     seconds an idle CDN connection is kept for the next request
 # POOL_MAX=4      idle connections kept per CDN host
 # RAW_VERIFY_TLS=0  skips the CDN certificate check (saves CPU on every new TLS connection; video bytes are not secret). Default 1.
+
+# --- HTTP FIRST (new): try plain http:// to the CDN, so the relay needs no TLS decrypt (biggest CPU cost) ---
+# HTTP_FIRST=1   (default) 1 = try http first, 0 = always https (old behaviour)
+# HTTP_TTL=86400 seconds a test result is remembered per CDN host (24 h). works -> http for 24 h, refused -> https for 24 h,
+#                then ONE new test. One failed http request while http is marked "works" is repeated over https for that
+#                request only. The result is lost when the relay restarts (first request tests again).
+# Logs: a line "[relay] http test <host>: WORKS / refused" at each test, and http_pipe=<n> in the [cpu] line.
