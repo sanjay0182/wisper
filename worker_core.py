@@ -26,22 +26,38 @@ def secret():
     return os.environ.get("LINK_SECRET", "").encode()
 
 
+def _xor(a, b):
+    """a XOR b (same length) - one big-int operation instead of a Python loop per byte"""
+    n = len(a)
+    return (int.from_bytes(a, "big") ^ int.from_bytes(b[:n], "big")).to_bytes(n, "big") if n else b""
+
+
+_KEY = {}
+
+
+def _key_for(sec):
+    k = _KEY.get(sec)
+    if k is None:
+        k = _KEY[sec] = hashlib.sha256(b"jf-enc|" + sec).digest()
+    return k
+
+
 def _ks(nonce, n):
-    k = hashlib.sha256(b"jf-enc|" + secret()).digest()
+    k = _key_for(secret())
     return b"".join(hmac.new(k, nonce + i.to_bytes(4, "big"), hashlib.sha256).digest() for i in range((n + 31) // 32))
 
 
 def enc(u):
     b = u.encode("utf-8")
     n = os.urandom(12)
-    return _b64(n + bytes(x ^ y for x, y in zip(b, _ks(n, len(b)))))
+    return _b64(n + _xor(b, _ks(n, len(b))))
 
 
 def dec(e):
     try:
         raw = _unb64(e)
         n, ct = raw[:12], raw[12:]
-        return bytes(x ^ y for x, y in zip(ct, _ks(n, len(ct)))).decode("utf-8")
+        return _xor(ct, _ks(n, len(ct))).decode("utf-8")
     except Exception:
         return ""
 

@@ -12,6 +12,7 @@ Two kinds of links:
 No database, no login - only the signed links from Render (same LINK_SECRET).
 """
 import asyncio
+import gc
 import hmac
 import json
 import os
@@ -47,6 +48,9 @@ BASE_H = {
 }
 # other CDN edges - when the main host answers 426/427/403 to this ip, the same path+query is tried on these
 FALLBACK_HOSTS = [h.strip() for h in os.getenv("FALLBACK_CDN_HOSTS", "cacdn.hakunaymatata.com,sbcdn5.hakunaymatata.com").split(",") if h.strip()]
+CHUNK = int(os.getenv("RELAY_CHUNK", "262144"))           # bytes handed to the server per step (bigger = far less CPU; was ~16 KB TLS records)
+HOST_TTL = int(os.getenv("HOST_TTL", "1800"))             # remember for this long which CDN host / UA worked
+gc.set_threshold(50000, 30, 30)                           # fewer garbage-collector runs (the relay keeps almost no long-lived objects)
 RESOLVE_TTL = int(os.getenv("RESOLVE_TTL", "600"))        # seconds a resolved video url is reused (mp4 = many Range requests)
 
 app = FastAPI(title="JaatFlix relay", docs_url=None, redoc_url=None, openapi_url=None)
@@ -62,6 +66,8 @@ _client = None
 _tok = {"v": "", "t": 0.0}
 _cache = {}      # spec json -> (time, url, referer)
 _locks = {}      # spec json -> asyncio.Lock  (one resolve at a time per film)
+_HOSTMAP = {}    # refused host -> (working host, user agent, expiry)
+_PLCACHE = {}    # (url, link token) -> (time, rewritten playlist)
 _STATS = {"resolve_ok": 0, "resolve_fail": 0, "cdn_fallback_ok": 0}
 
 
@@ -70,7 +76,7 @@ def client():
     if _client is None:
         kw = {"proxy": UPSTREAM_PROXY} if UPSTREAM_PROXY else {}
         _client = httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(30, connect=10),
-                                    limits=httpx.Limits(max_connections=60, max_keepalive_connections=20), **kw)
+                                    limits=httpx.Limits(max_connections=60, max_keepalive_connections=30, keepalive_expiry=60), http2=False, **kw)
     return _client
 
 
@@ -273,7 +279,7 @@ async def health():
 
 
 async def _fetch(u, ref, rng, ua=UA):
-    h = {"User-Agent": ua, "Referer": ref, "Origin": ref.rstrip("/"), "Accept": "*/*"}
+    h = {"User-Agent": ua, "Referer": ref, "Origin": ref.rstrip("/"), "Accept": "*/*", "Accept-Encoding": "identity"}
     if rng:
         h["Range"] = rng
     c = client()
@@ -282,6 +288,18 @@ async def _fetch(u, ref, rng, ua=UA):
 
 async def _open(u, ref, rng, spec=None):
     """open the CDN url.  On 401/403/404/410/426/427/451: (resolve links) a fresh url, then the other CDN hosts / alternate UA."""
+    p0 = urlparse(u)
+    mem = _HOSTMAP.get(p0.netloc.split(":")[0])
+    if mem and time.time() < mem[2]:                           # this host was refused before and an alternative worked: go straight there
+        cand0 = urlunparse((p0.scheme, mem[0], p0.path, p0.params, p0.query, p0.fragment))
+        try:
+            r = await _fetch(cand0, ref, rng, mem[1])
+            if r.status_code < 400:
+                return r, cand0
+            await r.aclose()
+        except Exception:
+            pass
+        _HOSTMAP.pop(p0.netloc.split(":")[0], None)
     r = await _fetch(u, ref, rng)
     if r.status_code < 400:
         return r, u
@@ -310,6 +328,7 @@ async def _open(u, ref, rng, spec=None):
                 continue
             if r.status_code < 400:
                 _STATS["cdn_fallback_ok"] += 1
+                _HOSTMAP[p.netloc.split(":")[0]] = (host, ua, time.time() + HOST_TTL)
                 print("[relay] fallback host worked: %s -> %s" % (_host(u), host), flush=True)
                 if spec is not None:                           # remember it, later Range requests go straight there
                     _cache[_key(spec)] = (time.time(), cand, ref)
@@ -354,17 +373,30 @@ async def relay(request: Request, e: str = "", t: str = "", q: str = ""):
         return Response("bad gateway", status_code=502, headers=no)
     ct = r.headers.get("content-type", "").lower()
     if r.status_code == 200 and ("mpegurl" in ct or u.split("?")[0].lower().endswith(".m3u8")):
+        ck = (u, t, q)
+        hit = _PLCACHE.get(ck)
+        if hit and time.time() - hit[0] < 120:                 # a retry / second viewer: no rewrite, no CDN read
+            await r.aclose()
+            return Response(hit[1], media_type="application/vnd.apple.mpegurl", headers=no)
         try:
             text = (await r.aread()).decode("utf-8", "ignore")
         finally:
             await r.aclose()
         body = core.rewrite_m3u8(text, str(r.url), p, q)
+        if len(_PLCACHE) > 60:
+            for k_ in sorted(_PLCACHE, key=lambda k: _PLCACHE[k][0])[:30]:
+                _PLCACHE.pop(k_, None)
+        _PLCACHE[ck] = (time.time(), body)
         return Response(body, media_type="application/vnd.apple.mpegurl", headers=no)
     keep = {k: v for k, v in r.headers.items() if k.lower() in ("content-type", "content-length", "content-range", "accept-ranges")}
+    if r.status_code in (200, 206):
+        keep["Cache-Control"] = "private, max-age=1800"          # seek back / retry is answered by the browser, not by this server
+    else:
+        keep["Cache-Control"] = "no-store"
 
     async def gen():
         try:
-            async for chunk in r.aiter_raw():
+            async for chunk in r.aiter_raw(CHUNK):
                 yield chunk
         finally:
             await r.aclose()

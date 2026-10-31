@@ -1,3 +1,6 @@
 fastapi>=0.115.0
 uvicorn>=0.30.0
 httpx>=0.27.0
+# optional speed-ups (uvicorn uses them automatically when present; Linux only)
+uvloop>=0.19.0; sys_platform != "win32"
+httptools>=0.6.0
