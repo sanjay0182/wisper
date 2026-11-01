@@ -22,6 +22,7 @@ can be measured) its real CPU.  RELAY_LOG=0 switches the blocks off.  The 10 sec
 import asyncio
 import json
 import os
+import socket
 import ssl
 import time
 from urllib.parse import parse_qs, quote, urlsplit
@@ -122,9 +123,14 @@ async def stats_loop():
     last = dict(STATS)
     tlast = dict(tlspass.STATS)
     t0, c0 = time.time(), time.process_time()
+    tm0 = os.times()
     while True:
         await asyncio.sleep(10)
         now, cn = time.time(), time.process_time()
+        tm = os.times()
+        ucpu = (tm.user - tm0.user) / max(0.001, now - t0) * 100
+        scpu = (tm.system - tm0.system) / max(0.001, now - t0) * 100
+        tm0 = tm
         d = {k: STATS[k] - last.get(k, 0) for k in STATS}
         last = dict(STATS)
         td = {k: tlspass.STATS[k] - tlast.get(k, 0) for k in tlspass.STATS}
@@ -132,8 +138,8 @@ async def stats_loop():
         if d["raw"] or d["fallback"] or d["pass"] or d["tls"]:
             mb = d["bytes"] / 1048576.0
             cpu = (cn - c0) / max(0.001, now - t0) * 100
-            print("[cpu] %ds: cpu=%d%% requests=%d (pipe=%d careful=%d app=%d) data=%.1fMB (%.2f cpu-sec/MB) new_tls=%d reused=%d http_pipe=%d tls_pass=%d splice=%d" % (
-                now - t0, cpu, d["raw"] + d["fallback"] + d["pass"] + d["tls"], d["raw"], d["fallback"], d["pass"], mb,
+            print("[cpu] %ds: cpu=%d%% (user %d%% + system %d%%) requests=%d (pipe=%d careful=%d app=%d) data=%.1fMB (%.2f cpu-sec/MB) new_tls=%d reused=%d http_pipe=%d tls_pass=%d splice=%d" % (
+                now - t0, cpu, ucpu, scpu, d["raw"] + d["fallback"] + d["pass"] + d["tls"], d["raw"], d["fallback"], d["pass"], mb,
                 ((cn - c0) / mb) if mb else 0, d["new_conn"], d["reused"], d["http"], d["tls"], d["splice"]), flush=True)
             nh = td["full"] + td["resumed"]
             if nh or td["fail"]:
@@ -357,6 +363,11 @@ async def _open_pipe(csp, method, ref, rng, why=None, tr=rtrace.NULL):
     return None
 
 
+# SPLICE_LOWAT: the event loop wakes up for the CDN socket only when at least this many bytes are waiting (SO_RCVLOWAT), so every
+# wake-up moves a big piece instead of 7-50 KB.  0 = off.  If that much does not arrive within SPLICE_LOWAT_WAIT seconds (end of the body,
+# or a slow CDN) it goes back to "wake up for any byte" for the rest of that request, so nothing can get stuck.
+SPLICE_LOWAT = int(os.getenv("SPLICE_LOWAT", "65536"))
+SPLICE_LOWAT_WAIT = float(os.getenv("SPLICE_LOWAT_WAIT", "0.25"))
 SPLICE = os.getenv("SPLICE", "1") != "0"      # bytes go CDN socket -> pipe -> phone socket inside the kernel (python never touches them)
 _SPLICE_OK = [hasattr(os, "splice")]
 _F_SETPIPE_SZ = 1031
@@ -427,6 +438,8 @@ async def _splice_pump(ur, uw, writer, idle=30, tr=rtrace.NULL, reason=None):
     n_in = n_out = w_in = w_out = 0
     cpu = 0.0
     ended = "?"
+    lowat_on = False
+    lowat_off = ""
     try:
         with tr.blk():
             try:
@@ -438,7 +451,17 @@ async def _splice_pump(ur, uw, writer, idle=30, tr=rtrace.NULL, reason=None):
             os.set_blocking(wp, False)
             utr.pause_reading()
             tr_.pause_reading()
-        tr.lap("splice 2: copy the sockets + make the pipe", "%s; python stops reading both sockets from now on" % psz)
+            lowat_on = False
+            if SPLICE_LOWAT > 0:
+                try:
+                    uw.get_extra_info("socket").setsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT, SPLICE_LOWAT)
+                    lowat_on = True
+                    lnote = "wake-up only when >= %dKB are waiting (SO_RCVLOWAT)" % (SPLICE_LOWAT // 1024)
+                except Exception as ex:
+                    lnote = "SO_RCVLOWAT not possible (%s): normal wake-ups" % repr(ex)[:50]
+            else:
+                lnote = "SPLICE_LOWAT=0: normal wake-ups"
+        tr.lap("splice 2: copy the sockets + make the pipe", "%s; %s; python stops reading both sockets from now on" % (psz, lnote))
         first = True
         while True:
             p = time.process_time()
@@ -449,7 +472,17 @@ async def _splice_pump(ur, uw, writer, idle=30, tr=rtrace.NULL, reason=None):
             except BlockingIOError:
                 cpu += time.process_time() - p
                 w_in += 1
-                if not await _wait_fd(loop, sfd, False, idle):
+                if not await _wait_fd(loop, sfd, False, SPLICE_LOWAT_WAIT if lowat_on else idle):
+                    if lowat_on:
+                        # not even SPLICE_LOWAT bytes came: tail of the body or a slow CDN. Back to "any byte wakes me" for this request.
+                        lowat_on = False
+                        lowat_off = "; wake-up limit dropped to 1 byte after %.1fMB (less than %dKB arrived within %.2fs)" % (
+                            (moved - len(buf)) / 1048576.0, SPLICE_LOWAT // 1024, SPLICE_LOWAT_WAIT)
+                        try:
+                            uw.get_extra_info("socket").setsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT, 1)
+                        except Exception:
+                            pass
+                        continue
                     if first and moved == len(buf):
                         _SPLICE_OK[0] = False           # nothing ever arrived this way: do not use it again
                         print("[relay] splice: no data, switching it off", flush=True)
@@ -489,8 +522,9 @@ async def _splice_pump(ur, uw, writer, idle=30, tr=rtrace.NULL, reason=None):
         calls = n_in + n_out + w_in + w_out
         tr.bytes += moved - len(buf)
         tr.lap("splice 3: copy CDN -> phone inside the kernel",
-               "%.2fMB moved; os.splice calls: %d in + %d out; waits for CDN data: %d, for the phone socket: %d; cpu in the syscalls %.1fms (%.3fms per call); ended: %s" % (
-                   (moved - len(buf)) / 1048576.0, n_in, n_out, w_in, w_out, cpu * 1000.0, cpu * 1000.0 / max(1, calls), ended))
+               "%.2fMB moved; os.splice calls: %d in + %d out (average piece %.0fKB); waits for CDN data: %d, for the phone socket: %d; cpu in the syscalls %.1fms (%.3fms per call); wake-up limit %s%s; ended: %s" % (
+                   (moved - len(buf)) / 1048576.0, n_in, n_out, (moved - len(buf)) / 1024.0 / max(1, n_in), w_in, w_out, cpu * 1000.0, cpu * 1000.0 / max(1, calls),
+                   "ON (%dKB)" % (SPLICE_LOWAT // 1024) if SPLICE_LOWAT > 0 else "off", lowat_off, ended))
     return moved
 
 

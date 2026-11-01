@@ -13,14 +13,27 @@ How to read the numbers
   cpu   = real CPU time of the code of that step, measured only around code that runs WITHOUT waiting
           (one block of python / one openssl call / one syscall), so no other request is mixed in.
           '-' means: this step is mostly waiting, there is no separate CPU number.
-  'whole-process cpu' = CPU of the whole python process between the start and the end of this request.
-          If 'other requests running' is more than 0, that number also contains their work.
+  'proc'  = CPU of the WHOLE python process during this step, split in user (python / openssl code) and sys (the kernel
+          working for us: network send / receive, splice, syscalls).  Not limited to the measured blocks, so it also shows
+          the cpu that no block caught.  If other requests run at the same time it contains their work too.
+  'whole-process cpu' = the same for the whole request (user + system), and 'not measured' = whole minus the blocks.
 
 RELAY_LOG=0 switches all of this off (the 10 second [cpu] line stays).
 """
 import itertools
 import os
 import time
+
+try:
+    import resource
+
+    def _ru():
+        """(user, system) cpu seconds of the whole process so far"""
+        r = resource.getrusage(resource.RUSAGE_SELF)
+        return r.ru_utime, r.ru_stime
+except Exception:                       # no resource module: only the total is known
+    def _ru():
+        return time.process_time(), 0.0
 
 ON = os.getenv("RELAY_LOG", "1") != "0"
 _ids = itertools.count(1)
@@ -89,6 +102,7 @@ class Trace:
         self.bytes = 0
         self.t0 = self._m = t0 if t0 is not None else time.perf_counter()     # t0/p0: when the connection really started
         self.p0 = p0 if p0 is not None else time.process_time()
+        self.ru0 = self._ru = _ru()
         self.rows = []                  # (name | None, wall ms, cpu ms | None, note)
         self._cpu = None                # cpu ms measured since the last lap
         self.cpu_sum = 0.0
@@ -109,7 +123,9 @@ class Trace:
     def lap(self, name, note=""):
         """close a step: wall time since the previous lap, plus the cpu measured meanwhile"""
         now = time.perf_counter()
-        self.rows.append((name, (now - self._m) * 1000.0, self._cpu, note))
+        u, s_ = _ru()
+        self.rows.append((name, (now - self._m) * 1000.0, self._cpu, note, (u - self._ru[0]) * 1000.0, (s_ - self._ru[1]) * 1000.0))
+        self._ru = (u, s_)
         self._m = now
         self._cpu = None
         o = ACTIVE[0] - 1
@@ -118,7 +134,7 @@ class Trace:
 
     def note(self, text):
         """a line without time: a decision, a reason, an error"""
-        self.rows.append((None, 0.0, None, text))
+        self.rows.append((None, 0.0, None, text, 0.0, 0.0))
 
     def end(self, tail="end / close connection"):
         if self.done:
@@ -132,6 +148,8 @@ class Trace:
             return
         total = (now - self.t0) * 1000.0
         proc = (time.process_time() - self.p0) * 1000.0
+        u, s_ = _ru()
+        pu, ps = (u - self.ru0[0]) * 1000.0, (s_ - self.ru0[1]) * 1000.0
         p = "[req #%d] " % self.id
         mb = self.bytes / 1048576.0
         head = "%s%s -> %s" % (p, self.kind, self.status)
@@ -142,16 +160,16 @@ class Trace:
             head += "  %s=%s" % (k, v)
         out = [head]
         n = 0
-        for name, wall, cpu, note in self.rows:
+        for name, wall, cpu, note, du, ds in self.rows:
             if name is None:
                 out.append("%s      * %s" % (p, note))
                 continue
             n += 1
-            out.append("%s%3d. %-34s wall %8.1fms  cpu %s%s" % (
+            out.append("%s%3d. %-34s wall %8.1fms  cpu %s  proc %7.1fms (user %6.1f sys %6.1f)%s" % (
                 p, n, name, wall, ("%7.2fms" % cpu) if cpu is not None else "      - ",
-                (" | " + note) if note else ""))
-        last = "%sEND total=%.0fms | steps cpu=%.1fms (only measured blocks) | whole-process cpu=%.0fms in this time | other requests at the same time: up to %d" % (
-            p, total, self.cpu_sum, proc, self.max_others)
+                du + ds, du, ds, (" | " + note) if note else ""))
+        last = "%sEND total=%.0fms | steps cpu=%.1fms (only measured blocks) | whole-process cpu=%.0fms (user %.0f + system %.0f) | NOT measured by any step: %.0fms | other requests at the same time: up to %d" % (
+            p, total, self.cpu_sum, proc, pu, ps, max(0.0, proc - self.cpu_sum), self.max_others)
         if self.bytes and total > 0:
             last += " | %.2fMB at %.2fMB/s" % (mb, mb / (total / 1000.0))
         out.append(last)

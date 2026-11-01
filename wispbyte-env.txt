@@ -68,3 +68,11 @@ WORKER_TRUST_PROXY=0
 # The new sw.js asks  /pt?...&k=1.  The relay then answers with header  X-Tls2: <master secret>.<client random>.<server random>.<hash>.<key length>.<seq>
 # and does NOT do the key expansion; tlsdec.js derive() does it on the phone. Without k=1 (old sw.js) the relay sends  X-Tls  (finished key) as before.
 # Deploy order does not matter: old sw.js + new relay and new sw.js + old relay both still work.
+
+# --- SPLICE WAKE-UP LIMIT (new): bigger pieces per wake-up, fewer wake-ups ---
+# SPLICE_LOWAT=65536       the event loop wakes up for the CDN socket only when this many bytes are waiting (0 = off, old behaviour).
+# SPLICE_LOWAT_WAIT=0.25   if that much does not arrive within this many seconds (end of the body / slow CDN) the limit drops to 1 byte
+#                          for the rest of that request, so nothing can get stuck.
+# Look in the log at "splice 3": "average piece ..KB" and "os.splice calls" (before: 7-50 KB pieces, 125-818 calls per 6 MB).
+# The log now also shows user / system cpu: every step has  proc ..ms (user .. sys ..),  the END line has  "NOT measured by any step",
+# and the 10 s [cpu] line has  (user ..% + system ..%).
