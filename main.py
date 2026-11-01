@@ -19,6 +19,9 @@ def _load_env(path):
 
 _load_env(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
+import cpucap  # noqa: E402
+cpucap.maybe_run(os.path.abspath(__file__))        # hard CPU limit: starts the real relay as a child and keeps it under CPU_LIMIT %
+
 from worker import app  # noqa: E402
 
 def _run_plain(port):
@@ -48,8 +51,11 @@ async def _run_raw(port):
         raise RuntimeError("loopback port %s not usable" % internal)
     raw = await asyncio.start_server(lambda r, w: rawpipe.handle(r, w, internal), "0.0.0.0", port,
                                      limit=rawpipe.CHUNK * 2, backlog=256)
+    import gc
+    gc.collect(); gc.freeze(); gc.set_threshold(100000, 50, 50)     # almost no GC pauses/CPU
     print("[relay] raw pipe on :%s (app on 127.0.0.1:%s)" % (port, internal), flush=True)
-    asyncio.create_task(rawpipe.stats_loop())
+    if os.getenv("RELAY_STATS", "0") == "1":
+        asyncio.create_task(rawpipe.stats_loop())
     await asyncio.gather(task, raw.serve_forever())
 
 

@@ -35,7 +35,7 @@ except Exception:                       # no resource module: only the total is 
     def _ru():
         return time.process_time(), 0.0
 
-ON = os.getenv("RELAY_LOG", "1") != "0"
+ON = os.getenv("RELAY_LOG", "0") == "1"   # default OFF (set RELAY_LOG=1 to debug)
 _ids = itertools.count(1)
 ACTIVE = [0]            # requests running right now
 

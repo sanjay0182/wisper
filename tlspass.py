@@ -35,6 +35,8 @@ ENABLED = os.getenv("TLS_PASS", "1") != "0"
 VERIFY_TLS = os.getenv("RAW_VERIFY_TLS", "1") != "0"
 SESS_TTL = int(os.getenv("PASS_SESSION_TTL", "3600"))
 STATS = {"ok": 0, "fail": 0, "resumed": 0, "full": 0, "hs_wall_ms": 0.0, "hs_cpu_ms": 0.0}
+_DNS = {}               # (host, port) -> (addresses, time)
+DNS_TTL = int(os.getenv("DNS_TTL", "600"))
 _SESS = {}              # host -> (SSLSession, master_secret, time)
 _PENDING = [0]          # handshakes in flight (the keylog file is only emptied when none is running)
 KEYLOG = ""
@@ -120,11 +122,17 @@ async def _handshake(host, port, cached, tr):
     Writes trace steps for: DNS, TCP connect, TLS handshake."""
     loop = asyncio.get_running_loop()
     # --- 1. DNS ---
-    infos = await asyncio.wait_for(loop.getaddrinfo(host, port, type=socket.SOCK_STREAM), 10)
-    addrs = []
-    for _f, _t, _p, _c, sa in infos:
-        if sa[0] not in addrs:
-            addrs.append(sa[0])
+    hit = _DNS.get((host, port))
+    if hit and time.time() - hit[1] < DNS_TTL:
+        addrs = list(hit[0])
+        _DNS[(host, port)] = (hit[0][1:] + hit[0][:1], hit[1])     # rotate: spread over the CDN's addresses
+    else:
+        infos = await asyncio.wait_for(loop.getaddrinfo(host, port, type=socket.SOCK_STREAM), 10)
+        addrs = []
+        for _f, _t, _p, _c, sa in infos:
+            if sa[0] not in addrs:
+                addrs.append(sa[0])
+        _DNS[(host, port)] = (addrs, time.time())
     tr.lap("DNS lookup of the CDN host", "%s -> %d address(es): %s (getaddrinfo runs in a helper thread)" % (host, len(addrs), ", ".join(addrs[:4])))
     # --- 2. TCP connect (the addresses in the order DNS gave them, like asyncio does) ---
     r = w = None
@@ -137,6 +145,7 @@ async def _handshake(host, port, cached, tr):
             last = ex
             failed.append("%s: %s" % (ip, repr(ex)[:50]))
     if w is None:
+        _DNS.pop((host, port), None)                 # stale addresses: look up again next time
         raise last or ConnectionError("no address")
     tr.lap("TCP connect to the CDN", "connected to %s:%d%s" % (ip, port, ("; failed before: " + " | ".join(failed)) if failed else ""))
     try:
@@ -259,8 +268,9 @@ async def open_pass(host, port, path_q, headers_text, why=None, tr=rtrace.NULL, 
                 res["s"] = kb[2 * klen + 4:2 * klen + 8].hex()
             tr.lap("work out the server write key (old way)", "key expansion done on the relay")
         with tr.blk():
-            if obj.session is not None:
-                _SESS[host] = (obj.session, ms, time.time())
+            if not (obj.session_reused and cached):          # resumed: the stored session is still good, skip the copy
+                if obj.session is not None:
+                    _SESS[host] = (obj.session, ms, time.time())
         tr.lap("remember the TLS session for the next request")
         # --- request ---
         with tr.blk():

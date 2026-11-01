@@ -51,7 +51,7 @@ POOL_MAX = int(os.getenv("POOL_MAX", "4"))
 # HTTP_FIRST=1 (default) / 0 = always https.  The result is remembered per CDN host for HTTP_TTL seconds (default 24 h):
 #   works -> every request goes over http for 24 h ; refused -> every request goes over https for 24 h ; then ONE new test.
 # If a single http request fails while http is marked "works", only THAT request is repeated over https (the mark stays).
-HTTP_FIRST = os.getenv("HTTP_FIRST", "1") != "0"
+HTTP_FIRST = os.getenv("HTTP_FIRST", "0") == "1"   # default OFF: CDN gives 403 on http, test only wasted ~500ms after each restart
 HTTP_TTL = int(os.getenv("HTTP_TTL", "86400"))
 _HTTP_MEM = {}          # host -> (True/False, time of the test)
 
@@ -366,7 +366,7 @@ async def _open_pipe(csp, method, ref, rng, why=None, tr=rtrace.NULL):
 # SPLICE_LOWAT: the event loop wakes up for the CDN socket only when at least this many bytes are waiting (SO_RCVLOWAT), so every
 # wake-up moves a big piece instead of 7-50 KB.  0 = off.  If that much does not arrive within SPLICE_LOWAT_WAIT seconds (end of the body,
 # or a slow CDN) it goes back to "wake up for any byte" for the rest of that request, so nothing can get stuck.
-SPLICE_LOWAT = int(os.getenv("SPLICE_LOWAT", "65536"))
+SPLICE_LOWAT = int(os.getenv("SPLICE_LOWAT", "262144"))
 SPLICE_LOWAT_WAIT = float(os.getenv("SPLICE_LOWAT_WAIT", "0.25"))
 SPLICE = os.getenv("SPLICE", "1") != "0"      # bytes go CDN socket -> pipe -> phone socket inside the kernel (python never touches them)
 _SPLICE_OK = [hasattr(os, "splice")]

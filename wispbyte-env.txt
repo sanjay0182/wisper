@@ -76,3 +76,20 @@ WORKER_TRUST_PROXY=0
 # Look in the log at "splice 3": "average piece ..KB" and "os.splice calls" (before: 7-50 KB pieces, 125-818 calls per 6 MB).
 # The log now also shows user / system cpu: every step has  proc ..ms (user .. sys ..),  the END line has  "NOT measured by any step",
 # and the 10 s [cpu] line has  (user ..% + system ..%).
+
+# --- DEFAULTS NOW (lean) ---
+# RELAY_LOG=0 (no per-request blocks), RELAY_STATS=0 (no 10s [cpu] line), HTTP_FIRST=0 (no http test).
+# To debug again: RELAY_LOG=1 RELAY_STATS=1 HTTP_FIRST=1
+# DNS_TTL=600 (CDN addresses cached 10 min), SPLICE_LOWAT=262144 (default now), gc frozen at start
+
+# --- HARD CPU LIMIT (new, cpucap.py) ---
+# main.py now starts a small governor that runs the real relay as a child and pauses it (SIGSTOP/SIGCONT) whenever it would use
+# more than CPU_LIMIT percent of one core on average. Wispbyte kills servers that stay above ~15%.
+# CPU_LIMIT=11     (default) 0 = off. Measured: average = limit, worst 1-second window about +2%.
+# CPU_BURST=0.01   cpu-seconds allowed in one quick burst
+# CPU_CAP_LOG=1    one line every 30 s: cpu used + how long the relay was paused
+
+# --- HARD CPU LIMIT (new, cpucap.py) ---
+# CPU_LIMIT=11    percent of one core the relay may use (default 11, 0 = off). Over the limit the relay is paused (SIGSTOP/SIGCONT).
+# CPU_BURST=0.01  small burst allowance in cpu-seconds
+# CPU_CAP_LOG=1   log a line every 30 s: cpu used + how long the relay was paused
