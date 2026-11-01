@@ -55,3 +55,16 @@ WORKER_TRUST_PROXY=0
 # SPLICE=1  (default) 0 = old python copy loop.  Used only by the pass-through (/pt) path; if the container does not allow it, or no data
 #           arrives that way, the relay switches it off by itself ("[relay] splice: no data, switching it off") and uses the old loop.
 # [cpu] line: splice=<n> = requests whose bytes were moved by splice
+
+# --- DETAIL LOG (new): one block per /p and /pt request, every step with its wall time and (where measurable) real cpu ---
+# RELAY_LOG=1   (default) 0 = no blocks (the 10 s [cpu] line stays). New file: rtrace.py (put it next to rawpipe.py).
+# Block looks like:  [req #12] pt GET -> 206 6.00MB total 1853ms host=...      then numbered steps, then  [req #12] END ... whole-process cpu=..ms
+#   wall = real time of the step (includes waiting).  cpu = real cpu of the code of that step ('-' = it only waits, no separate number).
+#   steps of a pass-through request: read head, check link, DNS, TCP connect, TLS handshake (FULL or RESUMED + its cpu), master secret
+#   from keylog, request, CDN first bytes, answer head, send to phone, splice setup, splice copy (calls, waits, cpu per call).
+# [cpu] line: a second line "pass-through handshakes: full=.. resumed=.. | handshake cpu total/avg" is printed every 10 s.
+
+# --- PHONE WORKS OUT THE KEY (new) ---
+# The new sw.js asks  /pt?...&k=1.  The relay then answers with header  X-Tls2: <master secret>.<client random>.<server random>.<hash>.<key length>.<seq>
+# and does NOT do the key expansion; tlsdec.js derive() does it on the phone. Without k=1 (old sw.js) the relay sends  X-Tls  (finished key) as before.
+# Deploy order does not matter: old sw.js + new relay and new sw.js + old relay both still work.
