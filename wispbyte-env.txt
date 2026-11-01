@@ -50,3 +50,8 @@ WORKER_TRUST_PROXY=0
 # Logs:  "[relay] tls pass-through <host>: WORKS ..."  or  "not possible (<reason>)"  or  "answer is <status> ..."
 #        "[relay] http test <host>: refused - https; reason: <status / Location / error>"   <- why http:// was refused
 #        [cpu] line: tls_pass=<n> = requests that were passed through
+
+# --- SPLICE (new): the video bytes move inside the kernel, python does not copy them ---
+# SPLICE=1  (default) 0 = old python copy loop.  Used only by the pass-through (/pt) path; if the container does not allow it, or no data
+#           arrives that way, the relay switches it off by itself ("[relay] splice: no data, switching it off") and uses the old loop.
+# [cpu] line: splice=<n> = requests whose bytes were moved by splice

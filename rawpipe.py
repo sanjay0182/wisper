@@ -23,6 +23,7 @@ import ssl
 import time
 from urllib.parse import parse_qs, quote, urlsplit
 
+import fcntl
 import tlspass
 import worker
 import worker_core as core
@@ -34,7 +35,7 @@ _ctx = ssl.create_default_context()
 if not VERIFY_TLS:
     _ctx.check_hostname = False
     _ctx.verify_mode = ssl.CERT_NONE
-STATS = {"raw": 0, "fallback": 0, "pass": 0, "bytes": 0, "new_conn": 0, "reused": 0, "http": 0, "tls": 0}
+STATS = {"raw": 0, "fallback": 0, "pass": 0, "bytes": 0, "new_conn": 0, "reused": 0, "http": 0, "tls": 0, "splice": 0}
 
 # ---- upstream connection pool: a TLS handshake + certificate check per request is the most expensive thing on a slow CPU ----
 _POOL = {}
@@ -117,9 +118,9 @@ async def stats_loop():
         if d["raw"] or d["fallback"] or d["pass"] or d["tls"]:
             mb = d["bytes"] / 1048576.0
             cpu = (cn - c0) / max(0.001, now - t0) * 100
-            print("[cpu] %ds: cpu=%d%% requests=%d (pipe=%d careful=%d app=%d) data=%.1fMB (%.2f cpu-sec/MB) new_tls=%d reused=%d http_pipe=%d tls_pass=%d" % (
+            print("[cpu] %ds: cpu=%d%% requests=%d (pipe=%d careful=%d app=%d) data=%.1fMB (%.2f cpu-sec/MB) new_tls=%d reused=%d http_pipe=%d tls_pass=%d splice=%d" % (
                 now - t0, cpu, d["raw"] + d["fallback"] + d["pass"] + d["tls"], d["raw"], d["fallback"], d["pass"], mb,
-                ((cn - c0) / mb) if mb else 0, d["new_conn"], d["reused"], d["http"], d["tls"]), flush=True)
+                ((cn - c0) / mb) if mb else 0, d["new_conn"], d["reused"], d["http"], d["tls"], d["splice"]), flush=True)
         t0, c0 = now, cn
 
 
@@ -308,6 +309,95 @@ async def _open_pipe(csp, method, ref, rng, why=None):
     return None
 
 
+SPLICE = os.getenv("SPLICE", "1") != "0"      # bytes go CDN socket -> pipe -> phone socket inside the kernel (python never touches them)
+_SPLICE_OK = [hasattr(os, "splice")]
+_F_SETPIPE_SZ = 1031
+
+
+async def _wait_fd(loop, fd, write, idle):
+    fut = loop.create_future()
+    (loop.add_writer if write else loop.add_reader)(fd, lambda: fut.done() or fut.set_result(True))
+    h = loop.call_later(idle, lambda: fut.done() or fut.set_result(False))
+    try:
+        return await fut
+    finally:
+        h.cancel()
+        (loop.remove_writer if write else loop.remove_reader)(fd)
+
+
+async def _splice_pump(ur, uw, writer, idle=30):
+    """Move the rest of the CDN answer to the phone without python touching the bytes.
+    -> number of bytes moved, or None when it could not be set up (nothing was moved: the caller uses the normal loop)."""
+    try:
+        if not (SPLICE and _SPLICE_OK[0]) or ur.at_eof():
+            return None
+        if writer.get_extra_info("ssl_object") is not None or uw.get_extra_info("ssl_object") is not None:
+            return None
+        tr, utr = writer.transport, uw.transport
+        buf = bytes(ur._buffer)                 # bytes python already read from the CDN socket
+        ur._buffer.clear()
+        if buf:
+            writer.write(buf)
+        await writer.drain()                    # nothing may wait in python's write buffer: from here the kernel writes to the socket
+        if tr.get_write_buffer_size():
+            return None
+        loop = asyncio.get_running_loop()
+        sfd = os.dup(uw.get_extra_info("socket").fileno())      # a copy of the fd: asyncio does not let two readers wait on its own fd
+        cfd = None
+        try:
+            cfd = os.dup(writer.get_extra_info("socket").fileno())
+            rp, wp = os.pipe()
+        except Exception:
+            os.close(sfd)
+            if cfd is not None:
+                os.close(cfd)
+            return None
+    except Exception:
+        return None
+    moved = len(buf)
+    try:
+        try:
+            fcntl.fcntl(wp, _F_SETPIPE_SZ, 1 << 20)
+        except OSError:
+            pass
+        os.set_blocking(rp, False)
+        os.set_blocking(wp, False)
+        utr.pause_reading()
+        tr.pause_reading()
+        first = True
+        while True:
+            try:
+                n = os.splice(sfd, wp, 1 << 20)
+            except BlockingIOError:
+                if not await _wait_fd(loop, sfd, False, idle):
+                    if first and moved == len(buf):
+                        _SPLICE_OK[0] = False           # nothing ever arrived this way: do not use it again
+                        print("[relay] splice: no data, switching it off", flush=True)
+                    break                               # the CDN went quiet
+                continue
+            first = False
+            if n == 0:
+                break                                   # the CDN closed: done
+            moved += n
+            while n > 0:
+                try:
+                    m = os.splice(rp, cfd, n)
+                except BlockingIOError:
+                    if not await _wait_fd(loop, cfd, True, idle):
+                        return moved
+                    continue
+                n -= m
+    except Exception:
+        pass                                            # the phone hung up or the CDN reset
+    finally:
+        for f in (sfd, cfd, rp, wp):
+            try:
+                os.close(f)
+            except OSError:
+                pass
+    return moved
+
+
 _PASS_BAD = {}          # host -> time: the CDN could not do TLS 1.2 + AES-GCM (or the handshake failed); do not try again for a while
 PASS_BAD_TTL = int(os.getenv("PASS_BAD_TTL", "1800"))
 
@@ -342,20 +432,43 @@ async def _try_pass(csp, ref, rng, writer, origin):
     head = ("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nX-Tls: %s.%s.%d\r\nCache-Control: no-store\r\n%s"
             "Access-Control-Expose-Headers: X-Tls\r\nConnection: close\r\n\r\n" % (res["k"], res["s"], res["q"], _cors(origin))).encode("latin-1")
     ur, uw = res["reader"], res["writer"]
+    loop = asyncio.get_running_loop()
+    tr = writer.transport
+    last = [loop.time()]
+    wd = [None]
+
+    def watch():                                # one timer for the whole copy (a wait_for per chunk costs a task each time)
+        if loop.time() - last[0] > 30:
+            uw.close()                          # CDN went quiet: the read below ends
+        else:
+            wd[0] = loop.call_later(10, watch)
+
     try:
         writer.write(head + b"".join(res["raws"]))
         STATS["bytes"] += sum(len(x) for x in res["raws"])
         await writer.drain()
+        moved = await _splice_pump(ur, uw, writer)
+        if moved is not None:
+            STATS["splice"] += 1
+            STATS["bytes"] += moved
+            return True
+        wd[0] = loop.call_later(10, watch)
+        n = 0
         while True:
-            d = await asyncio.wait_for(ur.read(CHUNK), 30)
-            if not d:
+            d = await ur.read(CHUNK)
+            if not d or tr.is_closing():
                 break
+            last[0] = loop.time()
             writer.write(d)
-            STATS["bytes"] += len(d)
-            await writer.drain()
+            n += len(d)
+            if tr.get_write_buffer_size() > 524288:     # wait for the phone only when it really is behind
+                await writer.drain()
+        STATS["bytes"] += n
     except Exception:
         pass                                    # the phone has what it needs and hung up, or the CDN went quiet
     finally:
+        if wd[0] is not None:
+            wd[0].cancel()
         try:
             uw.close()
         except Exception:
